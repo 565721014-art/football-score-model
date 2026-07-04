@@ -1,0 +1,4 @@
+interface:
+  display_name: "Opponent-Adjusted Football Model"
+  short_description: "Model national-team scorelines from raw results"
+  default_prompt: "Use $model-football-scorelines to calculate Argentina vs Egypt from raw match results with the bundled opponent-adjusted model."
