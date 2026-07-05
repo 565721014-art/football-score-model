@@ -1,4 +1,8 @@
 interface:
+  display_name: "Football Score Model"
+  short_description: "Model any national-team fixture from raw results"
+  default_prompt: "Use $football-score-model to calculate the requested national-team fixture from raw results."
+interface:
   display_name: "Opponent-Adjusted Football Model"
   short_description: "Model national-team scorelines from raw results"
   default_prompt: "Use $model-football-scorelines to calculate Argentina vs Egypt from raw match results with the bundled opponent-adjusted model."
