@@ -22,6 +22,11 @@ PRIMARY_START = pd.Timestamp("2022-01-01")
 CUTOFF_DATE = pd.Timestamp("2026-06-30")
 TARGET_DATE = pd.Timestamp("2026-07-02")
 TARGET_TEAMS = ("Portugal", "Croatia")
+TARGET_COMPETITION_CLASS = "world_cup_knockout"
+TARGET_REGRESSION_TYPE = "world_cup"
+TARGET_KNOCKOUT = 1.0
+TARGET_NEUTRAL = True
+TARGET_TEAM_A_IS_HOME = True
 N_SIMULATIONS = 50_000
 HISTORICAL_CAP = 0.08
 
@@ -531,14 +536,30 @@ def fit_weighted_poisson(obs: dict) -> dict:
     return result
 
 
+def target_home_indicator(scoring_team: str) -> float:
+    if TARGET_NEUTRAL:
+        return 0.0
+    team_a_is_scoring_home = scoring_team == TARGET_TEAMS[0] and TARGET_TEAM_A_IS_HOME
+    team_b_is_scoring_home = scoring_team == TARGET_TEAMS[1] and not TARGET_TEAM_A_IS_HOME
+    return float(team_a_is_scoring_home or team_b_is_scoring_home)
+
+
+def target_context_factor(model: dict, obs: dict, scoring_team: str) -> float:
+    competition_index = obs["comp_index"][TARGET_REGRESSION_TYPE]
+    eta = (
+        model["competition_effect"][competition_index]
+        + model["knockout_effect"] * TARGET_KNOCKOUT
+        + model["home_effect"] * target_home_indicator(scoring_team)
+    )
+    return float(math.exp(eta))
+
+
 def target_regression_lambda(model: dict, obs: dict, scoring_team: str, opponent: str) -> float:
-    world_cup_index = obs["comp_index"]["world_cup"]
     eta = (
         model["intercept"]
         + model["attack"][obs["team_index"][scoring_team]]
         + model["defense"][obs["team_index"][opponent]]
-        + model["competition_effect"][world_cup_index]
-        + model["knockout_effect"]
+        + math.log(target_context_factor(model, obs, scoring_team))
     )
     return float(math.exp(eta))
 
@@ -747,26 +768,24 @@ def main() -> None:
         "Portugal": target_regression_lambda(regression_recent, observations, "Portugal", "Croatia"),
         "Croatia": target_regression_lambda(regression_recent, observations, "Croatia", "Portugal"),
     }
-    context_factor = math.exp(
-        regression["competition_effect"][observations["comp_index"]["world_cup"]]
-        + regression["knockout_effect"]
-    )
-    context_factor_recent = math.exp(
-        regression_recent["competition_effect"][observations["comp_index"]["world_cup"]]
-        + regression_recent["knockout_effect"]
-    )
+    context_factor = {
+        team: target_context_factor(regression, observations, team) for team in TARGET_TEAMS
+    }
+    context_factor_recent = {
+        team: target_context_factor(regression_recent, observations, team) for team in TARGET_TEAMS
+    }
 
     lambda_elite = {
-        "Portugal": baseline * elite["Portugal"]["adjusted_attack"] * elite["Croatia"]["adjusted_defense"] * context_factor,
-        "Croatia": baseline * elite["Croatia"]["adjusted_attack"] * elite["Portugal"]["adjusted_defense"] * context_factor,
+        "Portugal": baseline * elite["Portugal"]["adjusted_attack"] * elite["Croatia"]["adjusted_defense"] * context_factor["Portugal"],
+        "Croatia": baseline * elite["Croatia"]["adjusted_attack"] * elite["Portugal"]["adjusted_defense"] * context_factor["Croatia"],
     }
     lambda_elite_recent = {
-        "Portugal": baseline_recent * elite_recent["Portugal"]["adjusted_attack"] * elite_recent["Croatia"]["adjusted_defense"] * context_factor_recent,
-        "Croatia": baseline_recent * elite_recent["Croatia"]["adjusted_attack"] * elite_recent["Portugal"]["adjusted_defense"] * context_factor_recent,
+        "Portugal": baseline_recent * elite_recent["Portugal"]["adjusted_attack"] * elite_recent["Croatia"]["adjusted_defense"] * context_factor_recent["Portugal"],
+        "Croatia": baseline_recent * elite_recent["Croatia"]["adjusted_attack"] * elite_recent["Portugal"]["adjusted_defense"] * context_factor_recent["Croatia"],
     }
     lambda_raw = {
-        "Portugal": baseline * summaries["Portugal"]["raw_attack"] * summaries["Croatia"]["raw_defense"] * context_factor,
-        "Croatia": baseline * summaries["Croatia"]["raw_attack"] * summaries["Portugal"]["raw_defense"] * context_factor,
+        "Portugal": baseline * summaries["Portugal"]["raw_attack"] * summaries["Croatia"]["raw_defense"] * context_factor["Portugal"],
+        "Croatia": baseline * summaries["Croatia"]["raw_attack"] * summaries["Portugal"]["raw_defense"] * context_factor["Croatia"],
     }
 
     prior_data = data[data["date"] < PRIMARY_START]
@@ -778,8 +797,8 @@ def main() -> None:
     baseline_prior = weighted_rate(prior_goals, prior_weights)
     prior_rates = {team: historical_prior_rates(team_rows[team], baseline_prior) for team in TARGET_TEAMS}
     lambda_prior = {
-        "Portugal": baseline_prior * prior_rates["Portugal"]["adjusted_attack"] * prior_rates["Croatia"]["adjusted_defense"] * context_factor,
-        "Croatia": baseline_prior * prior_rates["Croatia"]["adjusted_attack"] * prior_rates["Portugal"]["adjusted_defense"] * context_factor,
+        "Portugal": baseline_prior * prior_rates["Portugal"]["adjusted_attack"] * prior_rates["Croatia"]["adjusted_defense"] * context_factor["Portugal"],
+        "Croatia": baseline_prior * prior_rates["Croatia"]["adjusted_attack"] * prior_rates["Portugal"]["adjusted_defense"] * context_factor["Croatia"],
     }
 
     regression_weight, elite_weight = (0.82, 0.13) if elite_limited else (0.70, 0.25)
@@ -803,6 +822,7 @@ def main() -> None:
             "percentage_change": percent,
         }
     maximum_prior_change = max(abs(item["percentage_change"]) for item in prior_impact.values())
+    total_historical_influence_scaler = 1.0
     if maximum_prior_change > 5.0:
         recent_share = regression_weight + elite_weight
         regression_ratio = regression_weight / recent_share
@@ -847,6 +867,27 @@ def main() -> None:
                 "percentage_change": 100.0 * absolute / lambda_without_prior[team],
             }
 
+    # The fitted regression and elite components also contain capped historical
+    # observations. If their combined residual influence still breaches 5%
+    # after the explicit prior reaches zero, shrink the total historical
+    # displacement toward the recent-only result.
+    residual_history_change = max(abs(item["percentage_change"]) for item in prior_impact.values())
+    if residual_history_change > 5.0:
+        total_historical_influence_scaler = 5.0 / residual_history_change
+        lambda_final = {
+            team: lambda_without_prior[team]
+            + total_historical_influence_scaler * (lambda_final[team] - lambda_without_prior[team])
+            for team in TARGET_TEAMS
+        }
+        for team in TARGET_TEAMS:
+            absolute = lambda_final[team] - lambda_without_prior[team]
+            prior_impact[team] = {
+                "lambda_without_historical_prior": lambda_without_prior[team],
+                "lambda_with_historical_prior": lambda_final[team],
+                "absolute_change": absolute,
+                "percentage_change": 100.0 * absolute / lambda_without_prior[team],
+            }
+
     rho, rho_audit = fit_dixon_coles(data, observations, regression)
     simulation, distribution, probability_matrix = simulate(lambda_final["Portugal"], lambda_final["Croatia"], rho)
 
@@ -874,7 +915,9 @@ def main() -> None:
         "fixture": "Portugal vs Croatia",
         "target_date": TARGET_DATE.strftime("%Y-%m-%d"),
         "cutoff_date": CUTOFF_DATE.strftime("%Y-%m-%d"),
-        "target_neutral": True,
+        "target_neutral": TARGET_NEUTRAL,
+        "target_competition_class": TARGET_COMPETITION_CLASS,
+        "target_regression_type": TARGET_REGRESSION_TYPE,
         "source": {
             "file": str(SOURCE),
             "url": "https://raw.githubusercontent.com/martj42/international_results/master/results.csv",
@@ -893,7 +936,7 @@ def main() -> None:
         "elo": {
             "initial": elo["initial"],
             "home_advantage_elo_non_neutral_estimated": elo["home_advantage_elo_non_neutral"],
-            "target_home_advantage_elo": 0.0,
+            "target_home_advantage_elo": 0.0 if TARGET_NEUTRAL else elo["home_advantage_elo_non_neutral"],
             "brier": elo["brier"],
             "Portugal_final": elo["ratings"]["Portugal"],
             "Croatia_final": elo["ratings"]["Croatia"],
@@ -926,6 +969,7 @@ def main() -> None:
             "weighted_poisson_weight": regression_weight,
             "elite_subset_weight": elite_weight,
             "historical_prior_weight": prior_weight,
+            "total_historical_influence_scaler": total_historical_influence_scaler,
         },
         "prior_component": {
             "GlobalWeightedGoalsPerTeam_2018_2021": baseline_prior,
