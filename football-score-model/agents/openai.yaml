@@ -1,0 +1,4 @@
+interface:
+  display_name: "Football Score Model"
+  short_description: "Model national-team scores from raw results"
+  default_prompt: "Use $football-score-model to calculate the requested national-team fixture from raw results."
